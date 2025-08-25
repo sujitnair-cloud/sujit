@@ -9,6 +9,11 @@ DMR fixed-frequency scanner with real-time decode and optional IQ capture.
 Tested on Linux (Ubuntu). Designed to drop into your existing codebase.
 """
 
+# Set environment variables to fix Qt issues
+import os
+os.environ['QT_QPA_PLATFORM'] = 'xcb'
+os.environ['QT_LOGGING_RULES'] = 'qt.qpa.*=false'
+
 import csv
 from datetime import datetime
 import heapq
@@ -79,7 +84,7 @@ SAVE_DIR         = Path.home() / "dmr_audio"
 CSV_PATH         = SAVE_DIR / "dmr_log.csv"
 
 # dsd-fme: add extra flags here if you need (e.g., -fa for auto)
-DSD_FME_ARGS     = []  # e.g. ["-fa"]
+DSD_FME_ARGS     = ["-fa"]  # Auto mode for DMR detection
 
 # =========================
 # Derived settings
@@ -175,32 +180,31 @@ def run_co(cmd, timeout_s=10):
         return ""
 
 def rtl_power_slice(low_hz, high_hz, bin_hz, integ_s):
-    # Returns list of (freq_hz_center, power_db)
-    cmd = [
-        "rtl_power",
-        "-f", f"{low_hz}:{high_hz}:{bin_hz}",
-        "-i", f"{integ_s}",
-        "-1", "-"
-    ]
+    """
+    Return per-bin (freq_center_hz, power_db), parsing ALL bins from rtl_power.
+    CSV: date,time,hz_low,hz_high,hz_step,samples,db0,db1,...,dbN
+    """
+    cmd = ["rtl_power",
+           "-f", f"{int(low_hz)}:{int(high_hz)}:{int(bin_hz)}",
+           "-i", f"{integ_s}", "-1", "-"]
     out = run_co(cmd, timeout_s=max(5, int(integ_s*3)+3))
     results = []
     for line in out.splitlines():
-        if not line or line.startswith("#"): continue
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 7: continue
-        try:
-            f_low   = float(parts[2])
-            f_high  = float(parts[3])
-            step_hz = float(parts[4])
-            pwr_db  = float(parts[5])
-        except: 
+        if not line or line.startswith("#"):
             continue
-        # rtl_power compresses to an average per line; approximate center
-        # We'll subdivide into bins implied by step_hz if available.
-        # If step_hz equals our bin_hz, this is already per-bin.
-        # For speed, treat this line as a single bin centered.
-        f_center = (f_low + f_high) * 0.5
-        results.append( (f_center, pwr_db) )
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 7:
+            continue
+        try:
+            f_low  = float(parts[2])
+            f_step = float(parts[4])
+            powers = [float(x) for x in parts[6:]]  # <-- all per-bin powers
+        except Exception:
+            continue
+        for i, p_db in enumerate(powers):
+            f_center = f_low + (i + 0.5) * f_step
+            if low_hz <= f_center <= high_hz:
+                results.append((f_center, p_db))
     return results
 
 def dedup_bins(cands, min_separation_hz=12_500):
@@ -339,12 +343,12 @@ def start_decode(mhz, iq_mode):
     return proc, str(audio_wav), str(fm_raw_wav), (str(iq_file) if iq_file else ""), str(meta_log)
 
 def measure_rssi_window(mhz, window_hz=25_000):
-    lower = (mhz*1e6) - window_hz/2
-    upper = (mhz*1e6) + window_hz/2
-    out = rtl_power_slice(lower, upper, BIN_HZ, integ_s=0.10)
-    if not out: return None
-    # Use the last (averaged) power
-    return out[-1][1]
+    low  = (mhz * 1e6) - window_hz/2
+    high = (mhz * 1e6) + window_hz/2
+    bins = rtl_power_slice(low, high, BIN_HZ, integ_s=0.10)
+    if not bins:
+        return None
+    return max(p for _, p in bins)  # strongest bin near the carrier
 
 def init_dirs_and_csv():
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -367,27 +371,10 @@ def run_cmd_get_output(cmd_list, timeout_s=10):
         return ""
 
 def measure_rssi(lower_mhz, upper_mhz, bin_hz, integ_s):
-    # rtl_power -f LOWER:UPPER:BIN -i DURATION -1 -
-    cmd = [
-        "rtl_power",
-        "-f", f"{lower_mhz:.6f}M:{upper_mhz:.6f}M:{int(bin_hz)}",
-        "-i", str(integ_s),
-        "-1", "-"
-    ]
-    out = run_cmd_get_output(cmd, timeout_s=max(5, integ_s + 3))
-    # Parse last CSV line; power is field 6 (0-based index 5) in classic rtl_power output
-    # Format: date, time, hz_low, hz_high, hz_step, power_db, samples, ...
-    power = None
-    for line in out.strip().splitlines():
-        if not line or line.startswith("#"):
-            continue
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) >= 6:
-            try:
-                power = float(parts[5])
-            except:
-                pass
-    return power  # could be None
+    bins = rtl_power_slice(lower_mhz*1e6, upper_mhz*1e6, bin_hz, integ_s)
+    if not bins:
+        return None
+    return max(p for _, p in bins)
 
 def parse_dsd_meta_line(line):
     # Heuristics for DSD-FME output; adjust as needed for your build
@@ -735,7 +722,7 @@ class SDRScanner:
             
             for _ in range(num_frames):
                 samples = self.device.read_samples(self.fft_size)
-            if len(samples) > 0:
+                if len(samples) > 0:
                     all_samples.append(samples)
             
             if len(all_samples) == 0:
@@ -789,18 +776,20 @@ class SDRScanner:
                     signal_bins = power_spectrum_dbm >= half_power
                     signal_bw = len(signal_bins) * self.rbw
                     
-                    # REALISTIC BANDWIDTH REQUIREMENTS
+                    # REALISTIC BANDWIDTH REQUIREMENTS (INCLUDING DMR)
                     # FM Radio: ~200 kHz, TV: ~6 MHz, Cellular: ~1.25 MHz, WiFi: ~20 MHz
-                    min_bw = 50e3   # 50 kHz minimum (was 25 kHz)
-                    max_bw = 10e6   # 10 MHz maximum (reasonable upper limit)
+                    # DMR: ~12.5 kHz channels, narrowband signals
+                    min_bw = 8e3    # 8 kHz minimum (DMR channels)
+                    max_bw = 25e3   # 25 kHz maximum (narrowband signals)
                     
                     if min_bw <= signal_bw <= max_bw:
                         # FREQUENCY-SPECIFIC VALIDATION
                         freq_mhz = center_freq / 1e6
                         
-                        # REAL-WORLD ACTIVE FREQUENCY BANDS
+                        # REAL-WORLD ACTIVE FREQUENCY BANDS (INCLUDING VHF DMR)
                         valid_bands = [
                             (88, 108),    # FM Radio (strong local signals)
+                            (136, 174),   # VHF DMR/Amateur/Public Safety (DMR frequencies!)
                             (174, 216),   # TV VHF (if TV stations exist)
                             (470, 608),   # TV UHF (if TV stations exist)
                             (806, 902),   # Cellular (strong signals)
@@ -815,6 +804,8 @@ class SDRScanner:
                                 in_valid_band = True
                                 if 88 <= freq_mhz <= 108:
                                     band_name = "FM Radio"
+                                elif 136 <= freq_mhz <= 174:
+                                    band_name = "VHF DMR/Public Safety"
                                 elif 174 <= freq_mhz <= 216:
                                     band_name = "TV VHF"
                                 elif 470 <= freq_mhz <= 608:
@@ -2049,7 +2040,7 @@ class DMRMultiScanner:
 
         self.RTL_GAIN_DB      = 40              # Frontend gain
         self.AUDIO_RATE       = 48000           # rtl_fm / demod audio rate to dsd-fme
-        self.DSD_FME_ARGS     = []              # e.g., ["-fa"]
+        self.DSD_FME_ARGS     = ["-fa"]              # Auto mode for DMR detection
 
         self.SAVE_DIR         = Path.home() / "dmr_audio"
         self.CSV_PATH         = self.SAVE_DIR / "dmr_band_log.csv"
@@ -2077,10 +2068,18 @@ class DMRMultiScanner:
         return p
 
     def ensure_deps(self):
-        # required
-        for c in ["rtl_power", "rtl_fm", "dsd-fme", "sox"]:
+        # Always required
+        req = ["rtl_power", "rtl_fm", "dsd-fme"]
+        for c in req:
             self.which_or_die(c)
-        # optional IQ capture
+        
+        # Check for sox (optional - don't exit if missing)
+        sox_available = shutil.which("sox") is not None
+        if not sox_available:
+            print("⚠️  Warning: 'sox' not found. Audio processing will be limited.")
+            print("   Install with: sudo apt install sox")
+        
+        # Optional for IQ capture:
         return (shutil.which("rtl_sdr") is not None) and (shutil.which("csdr") is not None)
 
     def init_dirs_csv(self):
@@ -2102,32 +2101,31 @@ class DMRMultiScanner:
             return ""
 
     def rtl_power_slice(self, low_hz, high_hz, bin_hz, integ_s):
-        # Returns list of (freq_hz_center, power_db)
-        cmd = [
-            "rtl_power",
-            "-f", f"{low_hz}:{high_hz}:{bin_hz}",
-            "-i", f"{integ_s}",
-            "-1", "-"
-        ]
+        """
+        Return per-bin (freq_center_hz, power_db), parsing ALL bins from rtl_power.
+        CSV: date,time,hz_low,hz_high,hz_step,samples,db0,db1,...,dbN
+        """
+        cmd = ["rtl_power",
+               "-f", f"{int(low_hz)}:{int(high_hz)}:{int(bin_hz)}",
+               "-i", f"{integ_s}", "-1", "-"]
         out = self.run_co(cmd, timeout_s=max(5, int(integ_s*3)+3))
         results = []
         for line in out.splitlines():
-            if not line or line.startswith("#"): continue
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 7: continue
-            try:
-                f_low   = float(parts[2])
-                f_high  = float(parts[3])
-                step_hz = float(parts[4])
-                pwr_db  = float(parts[5])
-            except: 
+            if not line or line.startswith("#"):
                 continue
-            # rtl_power compresses to an average per line; approximate center
-            # We'll subdivide into bins implied by step_hz if available.
-            # If step_hz equals our bin_hz, this is already per-bin.
-            # For speed, treat this line as a single bin centered.
-            f_center = (f_low + f_high) * 0.5
-            results.append( (f_center, pwr_db) )
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 7:
+                continue
+            try:
+                f_low  = float(parts[2])
+                f_step = float(parts[4])
+                powers = [float(x) for x in parts[6:]]  # <-- all per-bin powers
+            except Exception:
+                continue
+            for i, p_db in enumerate(powers):
+                f_center = f_low + (i + 0.5) * f_step
+                if low_hz <= f_center <= high_hz:
+                    results.append((f_center, p_db))
         return results
 
     def dedup_bins(self, cands, min_separation_hz=12_500):
@@ -2253,12 +2251,12 @@ class DMRMultiScanner:
         return proc, str(audio_wav), str(fm_raw_wav), (str(iq_file) if iq_file else ""), str(meta_log)
 
     def measure_rssi_window(self, mhz, window_hz=25_000):
-        lower = (mhz*1e6) - window_hz/2
-        upper = (mhz*1e6) + window_hz/2
-        out = self.rtl_power_slice(lower, upper, self.BIN_HZ, integ_s=0.10)
-        if not out: return None
-        # Use the last (averaged) power
-        return out[-1][1]
+        low  = (mhz * 1e6) - window_hz/2
+        high = (mhz * 1e6) + window_hz/2
+        bins = self.rtl_power_slice(low, high, self.BIN_HZ, integ_s=0.10)
+        if not bins:
+            return None
+        return max(p for _, p in bins)  # strongest bin near the carrier
 
     def terminate_children(self):
         for p in self.CHILDREN:
@@ -2837,8 +2835,8 @@ class DMRMultiScannerWorker(QObject):
             'unique_frequencies': len(self.detected_frequencies),
             'scan_duration': scan_duration,
             'progress_percent': progress_percent,
-            'start_freq': self.dmr_multi_scanner.start_freq / 1e6,
-            'end_freq': self.dmr_multi_scanner.end_freq / 1e6
+            'start_freq': self.dmr_multi_scanner.BAND_MIN_HZ / 1e6,
+            'end_freq': self.dmr_multi_scanner.BAND_MAX_HZ / 1e6
         }
         self.dmr_multi_scan_stats.emit(stats)
     
